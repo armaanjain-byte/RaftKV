@@ -4,15 +4,19 @@ package statemachine
 type CommandOp string
 
 const (
-	OpPut CommandOp = "Put"
-	OpGet CommandOp = "Get"
+	OpPut      CommandOp = "Put"
+	OpGet      CommandOp = "Get"
+	OpDelete   CommandOp = "Delete"
+	OpRegister CommandOp = "Register"
 )
 
 // Command represents a deterministic operation to be applied to the state machine.
 type Command struct {
-	Op    CommandOp
-	Key   string
-	Value string
+	Op       CommandOp
+	Key      string
+	Value    string
+	ClientID int64
+	SeqNum   int64
 }
 
 // Result represents the outcome of applying a Command to the state machine.

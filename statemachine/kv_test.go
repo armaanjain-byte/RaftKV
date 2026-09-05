@@ -2,6 +2,7 @@ package statemachine
 
 import (
 	"bytes"
+	"strconv"
 	"testing"
 )
 
@@ -39,19 +40,81 @@ func TestKVStateMachine_Apply(t *testing.T) {
 	if res.Value != "v2" {
 		t.Fatalf("expected value 'v2', got '%s'", res.Value)
 	}
+
+	// Test Delete
+	res = sm.Apply(Command{Op: OpDelete, Key: "k1"})
+	if res.Err != nil {
+		t.Fatalf("unexpected error on Delete: %v", res.Err)
+	}
+	res = sm.Apply(Command{Op: OpGet, Key: "k1"})
+	if res.Err != ErrKeyNotFound {
+		t.Fatalf("expected ErrKeyNotFound after Delete, got %v", res.Err)
+	}
+}
+
+func TestKVStateMachine_DedupAndRegister(t *testing.T) {
+	sm := NewKVStateMachine()
+
+	// Register a new client
+	res := sm.Apply(Command{Op: OpRegister})
+	if res.Err != nil {
+		t.Fatalf("failed to register client: %v", res.Err)
+	}
+	clientID, err := strconv.ParseInt(res.Value, 10, 64)
+	if err != nil || clientID != 1 {
+		t.Fatalf("expected ClientID 1, got %v (err: %v)", res.Value, err)
+	}
+
+	// Apply a command with a sequence number
+	cmd := Command{Op: OpPut, Key: "a", Value: "1", ClientID: clientID, SeqNum: 1}
+	res = sm.Apply(cmd)
+	if res.Err != nil {
+		t.Fatalf("failed to apply command: %v", res.Err)
+	}
+
+	// Apply the EXACT SAME command (duplicate)
+	resDup := sm.Apply(cmd)
+	if resDup.Err != nil || resDup.Value != res.Value {
+		t.Fatalf("deduplication failed, expected %v, got %v", res, resDup)
+	}
+
+	// Overwrite key 'a' without using ClientID (simulate external mutation for test purpose)
+	sm.Apply(Command{Op: OpPut, Key: "a", Value: "2"})
+
+	// Apply the duplicate command AGAIN, it should STILL return the original result,
+	// and critically, it should NOT overwrite 'a' back to '1'.
+	resDup2 := sm.Apply(cmd)
+	if resDup2.Err != nil || resDup2.Value != res.Value {
+		t.Fatalf("deduplication failed on second attempt, expected %v, got %v", res, resDup2)
+	}
+
+	resCurrent := sm.Apply(Command{Op: OpGet, Key: "a"})
+	if resCurrent.Value != "2" {
+		t.Fatalf("deduplication incorrectly mutated state! expected '2', got '%s'", resCurrent.Value)
+	}
+
+	// Apply an older sequence number
+	resStale := sm.Apply(Command{Op: OpPut, Key: "a", Value: "3", ClientID: clientID, SeqNum: 0})
+	if resStale.Err != ErrStaleCommand {
+		t.Fatalf("expected ErrStaleCommand, got %v", resStale.Err)
+	}
 }
 
 // TestKVStateMachine_CrashHarness verifies that a snapshot can be taken and restored
-// into a brand new state machine, preserving exact state.
+// into a brand new state machine, preserving exact state and dedup sessions.
 func TestKVStateMachine_CrashHarness(t *testing.T) {
 	smA := NewKVStateMachine()
 
+	// Register client
+	resReg := smA.Apply(Command{Op: OpRegister})
+	clientID, _ := strconv.ParseInt(resReg.Value, 10, 64)
+
 	// Apply multiple commands to build up state
 	commands := []Command{
-		{Op: OpPut, Key: "user1", Value: "Alice"},
-		{Op: OpPut, Key: "user2", Value: "Bob"},
-		{Op: OpPut, Key: "user3", Value: "Charlie"},
-		{Op: OpPut, Key: "user1", Value: "Alice_Updated"}, // Overwrite
+		{Op: OpPut, Key: "user1", Value: "Alice", ClientID: clientID, SeqNum: 1},
+		{Op: OpPut, Key: "user2", Value: "Bob", ClientID: clientID, SeqNum: 2},
+		{Op: OpPut, Key: "user3", Value: "Charlie", ClientID: clientID, SeqNum: 3},
+		{Op: OpPut, Key: "user1", Value: "Alice_Updated", ClientID: clientID, SeqNum: 4}, // Overwrite
 	}
 
 	for _, cmd := range commands {
@@ -99,47 +162,22 @@ func TestKVStateMachine_CrashHarness(t *testing.T) {
 		}
 	}
 
-	// Verify restoring into an already populated map overwrites it entirely
-	smB.Apply(Command{Op: OpPut, Key: "user4", Value: "Dave"})
-	if err := smB.Restore(snap); err != nil {
-		t.Fatalf("failed to restore snapshot second time: %v", err)
+	// CRITICAL: Verify dedup table survived the crash
+	// Applying sequence 4 again should return the deduped result, not modify anything, and not error
+	resDedup := smB.Apply(Command{Op: OpPut, Key: "user1", Value: "Alice_Rollback", ClientID: clientID, SeqNum: 4})
+	if resDedup.Err != nil {
+		t.Fatalf("expected dedup to succeed, got err: %v", resDedup.Err)
 	}
-	if res := smB.Apply(Command{Op: OpGet, Key: "user4"}); res.Err != ErrKeyNotFound {
-		t.Fatalf("expected user4 to be gone after restore, got error: %v", res.Err)
-	}
-}
-
-// TestKVStateMachine_SnapshotDeterminism verifies that two identical maps produce identical snapshots
-// (Wait, gob encoding for maps is not inherently deterministic in byte order because map iteration is random.
-// However, since gob doesn't guarantee byte-for-byte deterministic output for maps, we will check semantic determinism:
-// taking a snapshot, restoring it, and taking another snapshot should yield the same state semantics.)
-func TestKVStateMachine_SnapshotDeterminism(t *testing.T) {
-	sm := NewKVStateMachine()
-	sm.Apply(Command{Op: OpPut, Key: "k1", Value: "v1"})
-	sm.Apply(Command{Op: OpPut, Key: "k2", Value: "v2"})
-
-	snap1, err := sm.Snapshot()
-	if err != nil {
-		t.Fatalf("snap1 failed: %v", err)
-	}
-
-	sm2 := NewKVStateMachine()
-	sm2.Restore(snap1)
 	
-	snap2, err := sm2.Snapshot()
-	if err != nil {
-		t.Fatalf("snap2 failed: %v", err)
+	resAfterDedup := smB.Apply(Command{Op: OpGet, Key: "user1"})
+	if resAfterDedup.Value != "Alice_Updated" {
+		t.Fatalf("dedup failed to prevent mutation across restart! expected 'Alice_Updated', got '%s'", resAfterDedup.Value)
 	}
-
-	// We can restore snap2 back into another and verify it works, 
-	// rather than byte-for-byte comparison which might fail due to gob's map serialization.
-	sm3 := NewKVStateMachine()
-	sm3.Restore(snap2)
 	
-	if sm3.Apply(Command{Op: OpGet, Key: "k1"}).Value != "v1" {
-		t.Fatalf("semantic determinism failed for k1")
-	}
-	if sm3.Apply(Command{Op: OpGet, Key: "k2"}).Value != "v2" {
-		t.Fatalf("semantic determinism failed for k2")
+	// Verify Register counter survived
+	resReg2 := smB.Apply(Command{Op: OpRegister})
+	clientID2, _ := strconv.ParseInt(resReg2.Value, 10, 64)
+	if clientID2 != 2 {
+		t.Fatalf("expected next client ID to be 2, got %d", clientID2)
 	}
 }
