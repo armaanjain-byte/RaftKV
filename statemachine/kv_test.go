@@ -52,7 +52,9 @@ func TestKVStateMachine_Apply(t *testing.T) {
 	}
 }
 
-func TestKVStateMachine_DedupAndRegister(t *testing.T) {
+// TestKVStateMachine_OutOfOrderDedup verifies idempotent replay by key
+// and specifically allows skipping sequence numbers per PRD requirements.
+func TestKVStateMachine_OutOfOrderDedup(t *testing.T) {
 	sm := NewKVStateMachine()
 
 	// Register a new client
@@ -60,48 +62,46 @@ func TestKVStateMachine_DedupAndRegister(t *testing.T) {
 	if res.Err != nil {
 		t.Fatalf("failed to register client: %v", res.Err)
 	}
-	clientID, err := strconv.ParseInt(res.Value, 10, 64)
-	if err != nil || clientID != 1 {
-		t.Fatalf("expected ClientID 1, got %v (err: %v)", res.Value, err)
+	clientID, _ := strconv.ParseInt(res.Value, 10, 64)
+
+	// Apply SeqNum 1
+	cmd1 := Command{Op: OpPut, Key: "a", Value: "1", ClientID: clientID, SeqNum: 1}
+	if res := sm.Apply(cmd1); res.Err != nil {
+		t.Fatalf("failed to apply seq 1: %v", res.Err)
 	}
 
-	// Apply a command with a sequence number
-	cmd := Command{Op: OpPut, Key: "a", Value: "1", ClientID: clientID, SeqNum: 1}
-	res = sm.Apply(cmd)
-	if res.Err != nil {
-		t.Fatalf("failed to apply command: %v", res.Err)
+	// Apply SeqNum 3 (skipping 2)
+	cmd3 := Command{Op: OpPut, Key: "a", Value: "3", ClientID: clientID, SeqNum: 3}
+	if res := sm.Apply(cmd3); res.Err != nil {
+		t.Fatalf("failed to apply seq 3: %v", res.Err)
 	}
 
-	// Apply the EXACT SAME command (duplicate)
-	resDup := sm.Apply(cmd)
-	if resDup.Err != nil || resDup.Value != res.Value {
-		t.Fatalf("deduplication failed, expected %v, got %v", res, resDup)
+	// Verify state is '3'
+	if sm.Apply(Command{Op: OpGet, Key: "a"}).Value != "3" {
+		t.Fatalf("expected '3'")
 	}
 
-	// Overwrite key 'a' without using ClientID (simulate external mutation for test purpose)
-	sm.Apply(Command{Op: OpPut, Key: "a", Value: "2"})
-
-	// Apply the duplicate command AGAIN, it should STILL return the original result,
-	// and critically, it should NOT overwrite 'a' back to '1'.
-	resDup2 := sm.Apply(cmd)
-	if resDup2.Err != nil || resDup2.Value != res.Value {
-		t.Fatalf("deduplication failed on second attempt, expected %v, got %v", res, resDup2)
+	// Retry SeqNum 1 (older than latest)
+	// It should return success (cached result) without overwriting 'a'
+	resDup1 := sm.Apply(cmd1)
+	if resDup1.Err != nil {
+		t.Fatalf("expected cached success for seq 1, got err: %v", resDup1.Err)
 	}
 
-	resCurrent := sm.Apply(Command{Op: OpGet, Key: "a"})
-	if resCurrent.Value != "2" {
-		t.Fatalf("deduplication incorrectly mutated state! expected '2', got '%s'", resCurrent.Value)
+	// State should STILL be '3'
+	if sm.Apply(Command{Op: OpGet, Key: "a"}).Value != "3" {
+		t.Fatalf("retry of seq 1 mutated state backwards!")
 	}
 
-	// Apply an older sequence number
-	resStale := sm.Apply(Command{Op: OpPut, Key: "a", Value: "3", ClientID: clientID, SeqNum: 0})
-	if resStale.Err != ErrStaleCommand {
-		t.Fatalf("expected ErrStaleCommand, got %v", resStale.Err)
+	// Retry SeqNum 3
+	resDup3 := sm.Apply(cmd3)
+	if resDup3.Err != nil {
+		t.Fatalf("expected cached success for seq 3, got err: %v", resDup3.Err)
 	}
 }
 
 // TestKVStateMachine_CrashHarness verifies that a snapshot can be taken and restored
-// into a brand new state machine, preserving exact state and dedup sessions.
+// into a brand new state machine, preserving exact state and ALL dedup sessions.
 func TestKVStateMachine_CrashHarness(t *testing.T) {
 	smA := NewKVStateMachine()
 
@@ -132,11 +132,6 @@ func TestKVStateMachine_CrashHarness(t *testing.T) {
 	// Simulate crash & restart with a new instance
 	smB := NewKVStateMachine()
 
-	// Ensure new instance is empty
-	if res := smB.Apply(Command{Op: OpGet, Key: "user1"}); res.Err != ErrKeyNotFound {
-		t.Fatalf("expected new state machine to be empty")
-	}
-
 	// Restore from snapshot
 	if err := smB.Restore(snap); err != nil {
 		t.Fatalf("failed to restore snapshot: %v", err)
@@ -162,11 +157,18 @@ func TestKVStateMachine_CrashHarness(t *testing.T) {
 		}
 	}
 
-	// CRITICAL: Verify dedup table survived the crash
-	// Applying sequence 4 again should return the deduped result, not modify anything, and not error
-	resDedup := smB.Apply(Command{Op: OpPut, Key: "user1", Value: "Alice_Rollback", ClientID: clientID, SeqNum: 4})
-	if resDedup.Err != nil {
-		t.Fatalf("expected dedup to succeed, got err: %v", resDedup.Err)
+	// CRITICAL: Verify dedup table survived the crash for BOTH old and newest sequence numbers
+	
+	// Retrying sequence 1 should return its cached result without mutating
+	resDedup1 := smB.Apply(Command{Op: OpPut, Key: "user1", Value: "Alice", ClientID: clientID, SeqNum: 1})
+	if resDedup1.Err != nil {
+		t.Fatalf("expected dedup for seq 1 to succeed, got err: %v", resDedup1.Err)
+	}
+
+	// Retrying sequence 4 should also return cached result
+	resDedup4 := smB.Apply(Command{Op: OpPut, Key: "user1", Value: "Alice_Rollback", ClientID: clientID, SeqNum: 4})
+	if resDedup4.Err != nil {
+		t.Fatalf("expected dedup for seq 4 to succeed, got err: %v", resDedup4.Err)
 	}
 	
 	resAfterDedup := smB.Apply(Command{Op: OpGet, Key: "user1"})

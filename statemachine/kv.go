@@ -10,12 +10,11 @@ import (
 
 // ErrKeyNotFound is returned when a Get operation looks up a key that does not exist.
 var ErrKeyNotFound = errors.New("key not found")
-var ErrStaleCommand = errors.New("stale command sequence number")
 
-// Session tracks the latest applied command sequence and its result for a given client.
+// Session tracks all applied commands and their results for a given client
+// to support idempotent replay of ANY previously-seen sequence number.
 type Session struct {
-	LastSeqNum int64
-	LastResult Result
+	Results map[int64]Result
 }
 
 // kvState represents the entire state of the KV machine that must be snapshot/restored.
@@ -51,18 +50,15 @@ func (kv *KVStateMachine) Apply(cmd Command) Result {
 	if cmd.Op == OpRegister {
 		newID := kv.state.NextClientID
 		kv.state.NextClientID++
-		kv.state.Sessions[newID] = Session{LastSeqNum: 0, LastResult: Result{}}
+		kv.state.Sessions[newID] = Session{Results: make(map[int64]Result)}
 		return Result{Value: strconv.FormatInt(newID, 10), Err: nil}
 	}
 
-	// For standard operations, verify dedup table
+	// For standard operations, verify dedup table for idempotent replay
 	session, exists := kv.state.Sessions[cmd.ClientID]
 	if exists {
-		if cmd.SeqNum < session.LastSeqNum {
-			return Result{Value: "", Err: ErrStaleCommand}
-		}
-		if cmd.SeqNum == session.LastSeqNum {
-			return session.LastResult
+		if res, alreadyApplied := session.Results[cmd.SeqNum]; alreadyApplied {
+			return res // Idempotent replay of previously-seen sequence number
 		}
 	}
 
@@ -85,12 +81,13 @@ func (kv *KVStateMachine) Apply(cmd Command) Result {
 		res = Result{Value: "", Err: errors.New("unknown command operation")}
 	}
 
-	// Update session tracking if a valid client is provided (allow 0 to bypass for raw tests)
+	// Update session tracking if a valid client is provided
 	if cmd.ClientID != 0 {
-		kv.state.Sessions[cmd.ClientID] = Session{
-			LastSeqNum: cmd.SeqNum,
-			LastResult: res,
+		if !exists {
+			session = Session{Results: make(map[int64]Result)}
+			kv.state.Sessions[cmd.ClientID] = session
 		}
+		session.Results[cmd.SeqNum] = res
 	}
 
 	return res
