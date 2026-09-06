@@ -1,8 +1,6 @@
 package raft
 
 import (
-	"bytes"
-	"encoding/gob"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -81,28 +79,20 @@ func Make(peers []NetworkPeer, me int, persister *Persister) *Raft {
 	return rf
 }
 
+// persist encodes (currentTerm, votedFor) as one atomic blob and writes it.
+// MUST be called with rf.mu held.
+// Invariant: currentTerm and votedFor are ALWAYS persisted together in one write;
+// there is no code path that writes only one of them.
 func (rf *Raft) persist() {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	enc.Encode(rf.currentTerm)
-	enc.Encode(rf.votedFor)
-	rf.persister.SaveRaftState(buf.Bytes())
+	rf.persister.SaveRaftState(EncodeRaftState(rf.currentTerm, rf.votedFor))
 }
 
+// readPersist restores (currentTerm, votedFor) from a persisted blob.
+// Safe to call with nil/empty data (treated as fresh start).
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 {
-		return
-	}
-	buf := bytes.NewBuffer(data)
-	dec := gob.NewDecoder(buf)
-	var term int
-	var votedFor int
-	if err := dec.Decode(&term); err == nil {
-		rf.currentTerm = term
-	}
-	if err := dec.Decode(&votedFor); err == nil {
-		rf.votedFor = votedFor
-	}
+	term, votedFor := DecodeRaftState(data)
+	rf.currentTerm = term
+	rf.votedFor = votedFor
 }
 
 func (rf *Raft) resetElectionTimer() {
