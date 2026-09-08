@@ -1,7 +1,6 @@
 package statemachine
 
 import (
-	"bytes"
 	"strconv"
 	"testing"
 )

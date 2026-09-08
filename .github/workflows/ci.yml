@@ -1,14 +1,60 @@
 name: CI
-on: [push, pull_request]
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
 jobs:
-  build:
+  format:
+    name: Format check
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-go@v5
-      with:
-        go-version: 'stable'
-    - run: go fmt ./...
-    - run: go vet ./...
-    - run: go test ./...
-    - run: go test -race ./...
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Check gofmt
+        run: |
+          fmt_out=$(gofmt -l ./...)
+          if [ -n "$fmt_out" ]; then
+            echo "Files not formatted:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+  vet:
+    name: Vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - run: go vet ./...
+
+  test:
+    name: Unit & Integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Run tests
+        run: go test -timeout 120s ./...
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Run tests with race detector
+        run: go test -race -timeout 120s ./...
